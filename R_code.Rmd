@@ -1,0 +1,709 @@
+---
+title: "R_code"
+author: "BMQH3"
+date: "2023-08-09"
+output: html_document
+---
+
+Suppressing Warnings for the entire file to make the console results and neater
+
+```{r Setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+This contains all the libraries
+```{r Libraries}
+library(raster)
+library(dismo)
+library(tmap)
+library(ggplot2)
+library(sf)
+library(rJava)
+library(spdep)
+library(terra)
+library(tictoc)
+library(dplyr)
+```
+
+Loading the shapefiles, NDVI and future variables.
+```{r SFs NDVI and future}
+tic("Complete Notebook")
+newind_sf <- read_sf("india_states/India_states.shp")
+tmap_options(check.and.fix = TRUE)
+fire <- read.csv("two/fire_archive_M-C61_373392.csv")
+ndvi <- raster("filteredndvi/ocm2_ndvi_filt_16to30_jun2021_v01_01.tif")
+tn<- raster("future_var/wc2.1_10m_tmin_ACCESS-CM2_ssp126_2021-2040.tif")
+tx <- raster("future_var/wc2.1_10m_tmax_ACCESS-CM2_ssp126_2021-2040.tif")
+prec <- raster("future_var/wc2.1_10m_prec_ACCESS-CM2_ssp126_2021-2040.tif")
+bioc <- raster("future_var/wc2.1_10m_bioc_ACCESS-CM2_ssp126_2021-2040.tif")
+```
+
+Loading historic variables
+```{r Historic}
+temp <- raster("present_var/wc2.1_10m_tavg_12.tif")
+oldprec <- raster("present_var/wc2.1_10m_prec_12.tif")
+oldbio <- raster("present_var/wc2.1_10m_bio_19.tif")
+wind <- raster("present_var/wc2.1_10m_wind_12.tif")
+elev <-raster("present_var/wc2.1_10m_elev.tif")
+```
+
+```{r Confidence filter}
+# Calculate the average of the 'value_column'
+avg_confidence <- mean(fire$confidence)
+
+# Print the result
+print(avg_confidence)
+```
+
+```{r Applying filter}
+# Filter the shapefile to include only rows above average
+filtered_fire <- fire %>%
+  filter(confidence > avg_confidence)
+```
+
+Adding CRS to fires
+```{r Spatial points object conversion}
+coordinates(filtered_fire) = ~longitude+latitude
+```
+
+```{r Setting CRS}
+crs(filtered_fire) <- "+proj=longlat +datum=WGS84 +no_defs"
+```
+
+```{r Testing fire points}
+tm_shape(newind_sf) + tm_polygons() + tm_shape(filtered_fire) + tm_dots(col = "red")
+```
+
+
+Ensuring that the shapefile and wildfire are in the same CRS
+
+```{r CRS Check - fire}
+crs(filtered_fire)
+```
+
+```{r CRS Check - Shapefile}
+crs(newind_sf)
+```
+
+shows missing areas in shapefiles
+```{r SF Check}
+st_is_valid(newind_sf)
+```
+
+In order to help predict fire points, it is essential to great absence or background points in order to create a dataset which can be tested
+
+```{r Generating backgound points}
+tic("data generation")
+# setting the seed
+set.seed(21092202)
+# transforming 'sf' object ind_Sf into 'sp' object to help generate random samples
+india_sp <- as(newind_sf, Class = "Spatial")
+# spsample() generates twice number of fire occurrence points randomly within the Indian border
+background_points <- spsample(india_sp, n=2*length(filtered_fire), "random")
+toc()
+```
+
+The next step is to crop and mask all the areas to fit the shape file, giving us only the data we need within the borders of India
+
+```{r Cropping and masking rasters}
+ndvi_crop <- crop(ndvi, newind_sf)
+ndvi_mask <- mask(ndvi_crop,newind_sf)
+
+tn_crop <- crop(tn, newind_sf)
+tn_mask <- mask(tn_crop,newind_sf)
+
+tx_crop <- crop(tx, newind_sf)
+tx_mask <- mask(tx_crop,newind_sf)
+
+prec_crop <- crop(prec, newind_sf)
+prec_mask <- mask(prec_crop,newind_sf)
+
+bioc_crop <- crop(bioc, newind_sf)
+bioc_mask <- mask(bioc_crop,newind_sf)
+
+temp_crop <- crop(temp, newind_sf)
+temp_mask <- mask(temp_crop,newind_sf)
+
+oldprec_crop <- crop(oldprec, newind_sf)
+oldprec_mask <- mask(oldprec_crop,newind_sf)
+
+oldbio_crop <- crop(oldbio, newind_sf)
+oldbio_mask <- mask(oldbio_crop,newind_sf)
+
+wind_crop <- crop(wind, newind_sf)
+wind_mask <- mask(wind_crop,newind_sf)
+
+elev_crop <- crop(elev, newind_sf)
+elev_mask <- mask(elev_crop,newind_sf)
+```
+
+Population Density and Historic Bioclimatic Variables hold very little influence and are thus excluded.
+
+Separating Historic and Future Variables
+
+Checking the resolution of files to find the lowest resolution, serving as the base for the stack
+```{r Checking resolutions}
+ndvi_mask
+tn_mask
+tx_mask
+prec_mask
+bioc_mask
+temp_mask
+oldprec_mask
+wind_mask
+elev_mask
+```
+We can observe that the NDVI file needs to be downsampled to the resolution of the other files, here, done with the temp_mask file
+
+```{r Resizing NDVI}
+ndvi_resampled <- projectRaster(ndvi_mask,temp_mask, method = 'ngb')
+ndvi_resampled
+```
+To observe all the variables. Does not need to be run if it is taking too much time, which is why the code cell is noted as markdown.
+
+{r Generating covariate plots}
+tic("plots")
+Historic Variables
+hist1 <- tm_shape(ndvi_resampled) + tm_raster(style = "cont", title = "NDVI", palette= "Greens") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "A") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+hist2 <- tm_shape(temp_mask) + tm_raster(style = "cont", title = "Avg Temp", palette= "Oranges") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "B") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+hist3 <- tm_shape(oldprec_mask) + tm_raster(style = "cont", title = "Hist Prec", palette= "-Blues") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "C") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+hist4 <- tm_shape(wind_mask) + tm_raster(style = "cont", title = "Wind", palette= "Spectral") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "D") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+hist5 <- tm_shape(elev_mask) + tm_raster(style = "cont", title = "Elev", palette= "-Spectral") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "E") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+Future Variables
+
+
+fut1 <- tm_shape(tn_mask) + tm_raster(style = "cont", title = "Min Temp", palette= "Spectral") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "A") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+fut2 <- tm_shape(tx_mask) + tm_raster(style = "cont", title = "Max Temp", palette= "Spectral") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "B") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+fut3 <- tm_shape(prec_mask) + tm_raster(style = "cont", title = "Fut Prec", palette= "Blues") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "C") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+fut4 <- tm_shape(bioc_mask) + tm_raster(style = "cont", title = "Fut Bioc", palette= "Greens") +
+            tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+            tm_layout(frame = FALSE, legend.position = c("right", "top"), title.position = c("left", "bottom"), title = "D") +
+  tm_layout(
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 1, frame='white')
+
+
+tmap_arrange(hist1, hist2, hist3, hist4, hist5, nrow = 2)
+
+tmap_arrange(fut1, fut2, fut3, fut4)
+toc()
+
+As we can observe, the NDVI raster is of the same resolution as the others. The stack of multiple rasters can now be created
+
+The first stack is using historical data
+
+```{r Creating historic stack}
+envCovariates <- stack(temp_mask, oldprec_mask, wind_mask, ndvi_resampled,elev_mask)
+names(envCovariates) <- c("Average Temperature", "Precipitation", "Wind", "NDVI", "Elevation")
+```
+
+```{r Checking the stack}
+plot(envCovariates)
+```
+
+Adding the points to make a matrix
+
+```{r Historic matrix}
+fire_env <- extract(envCovariates, filtered_fire)
+background_points_env <- extract(envCovariates, background_points)
+```
+
+Preparing the dataset by converting the matrices into dataframes
+
+```{r Historic data frame}
+fire_env <-data.frame(fire_env,fire=1)
+background_points_env <-data.frame(background_points_env,fire=0)
+```
+
+Splitting the data
+
+First for the fire points
+```{r Historic K fold fires}
+# setting the same seed as earlier
+set.seed(21092202)
+# using the k-fold function to split data into 4 equal parts, with 25% being used to test the model and the remainder being used to train it
+select <- kfold(fire_env, 4)
+fire_env_test <- fire_env[select==1,] #takes 1 out of 4 parts
+fire_env_train <- fire_env[select!=1,] #takes the rest
+```
+
+Then for the backgrounds points
+```{r Historic K fold background}
+set.seed(21092202)
+select <- kfold(background_points_env, 4)
+background_points_env_test <- background_points_env[select==1,]
+background_points_env_train <- background_points_env[select!=1,]
+```
+
+Binding the testing and training data together
+```{r Historic binding}
+training_data <- rbind(fire_env_train, background_points_env_train)
+testing_data <- rbind(fire_env_test, background_points_env_test)
+```
+
+Ensuring there are no NA values
+```{r Historic NA completition}
+training_data <- training_data[complete.cases(training_data), ]
+testing_data <- testing_data[complete.cases(testing_data), ]
+```
+
+The model is now passed through the first of the models, a Cauchy Regression Model
+```{r Creating a Cauchy Regression Model}
+cauch_reg_model <- glm(fire ~ Average.Temperature + Precipitation + Wind + NDVI + Elevation,
+                     family = binomial (link = "cauchit"),
+                     data = training_data)
+summary(cauch_reg_model)
+```
+
+```{r Filtering data to evaluate the model}
+presence_data <- filter (training_data, fire == 1)
+absence_data <- filter (testing_data, fire == 0)
+evaluation <- evaluate (presence_data, absence_data, cauch_reg_model)
+plot(evaluation, 'ROC')
+```
+
+```{r Comparing fire points with the predicted spread}
+refire <- read.csv("two/fire_archive_M-C61_373392.csv")
+filtered_refire <- refire %>%
+  filter(confidence > avg_confidence)
+
+predictions = predict(envCovariates,
+                      cauch_reg_model,
+                      type = "response")
+
+plot(predictions, main = "Wildfire Forecast Using Present Variables")
+
+plot(predictions, main = "Forecast with Overlaid  Current Presence Points")
+points(filtered_refire[c("longitude", "latitude")], pch = 19, cex = 0.1)
+```
+
+
+```{r adding a threshold limit of above 0.5}
+plot(predictions > 0.5, main = "Threshold over 0.5")
+```
+Plotting the area exceeding a prevalence threshold along with the original predicitons
+
+```{r Plotting the area exceeding a threshold along with the current fire points}
+tr = threshold(evaluation, stat = 'prevalence')
+plot(predictions > tr, main = "Prevalence Threshold")
+```
+
+```{r Examining the Threshold Value}
+tr
+```
+
+
+Repeating the earlier steps with predicted climate data
+
+```{r Same Steps as Chunks 18-25 from 31-37 }
+futureenvCovariates <- stack(ndvi_resampled, tn_mask, tx_mask, prec_mask, bioc_mask)
+names(futureenvCovariates) <- c("NDVI", "Minimum Temperature", "Maximum Temperature", "Precipitation", "Bioclimatic Variables")
+```
+
+```{r}
+new_fire_env <- extract(futureenvCovariates, filtered_fire)
+new_background_points_env <- extract(futureenvCovariates, background_points)
+```
+
+```{r}
+new_fire_env <-data.frame(new_fire_env,fire=1)
+new_background_points_env <-data.frame(new_background_points_env,fire=0)
+```
+
+```{r}
+set.seed(21092202)
+select <- kfold(new_fire_env, 4)
+new_fire_env_test <- new_fire_env[select==1,]
+new_fire_env_train <- new_fire_env[select!=1,]
+```
+
+```{r}
+set.seed(21092202)
+select <- kfold(new_background_points_env, 4)
+new_background_points_env_test <- new_background_points_env[select==1,]
+new_background_points_env_train <- new_background_points_env[select!=1,]
+```
+
+```{r}
+new_training_data <- rbind(new_fire_env_train, new_background_points_env_train)
+new_testing_data <- rbind(new_fire_env_test, new_background_points_env_test)
+```
+
+```{r}
+new_training_data <- new_training_data[complete.cases(new_training_data), ]
+new_testing_data <- new_testing_data[complete.cases(new_testing_data), ]
+```
+
+```{r Cauchy Reg Model with predicted climate data}
+new_cauch_reg_model <- glm(fire ~ NDVI + Minimum.Temperature + Maximum.Temperature + Precipitation + Bioclimatic.Variables,
+                     family = binomial (link = "cauchit"),
+                     data = new_training_data)
+summary(new_cauch_reg_model)
+```
+Generating a forecast plot of wildfires based on predicted climate data
+
+```{r Forecast Plot}
+forecasts = predict(futureenvCovariates,
+                    new_cauch_reg_model,
+                    type = "response")
+plot(forecasts,main = "Forecast using Future Variables")
+```
+```{r evaluating the future stack model}
+new_presence_data <- filter (new_training_data, fire == 1)
+new_absence_data <- filter (new_testing_data, fire == 0)
+evaluation <- evaluate (new_presence_data, new_absence_data, new_cauch_reg_model)
+plot(evaluation, 'ROC')
+```
+
+Moving on to the second model, A Maximum entropy or MAXENT model for futher analysis
+
+```{r Maxent Model}
+tic("MaxEnt")
+model_training <- maxent(x=training_data[,c(1,2,3,4,5)], p=training_data[,6], args=c("responsecurves"))
+toc()
+```
+
+Plotting the variable contribution to the model's results
+
+```{r Variable Plot}
+plot(model_training, pch=19, xlab = "Percentage [%]", cex=1.1)
+```
+Visualising all the results of the model
+
+```{r Model Results}
+model_training@results
+```
+Visualising the individual plots for each variable and it's effect on the model in terms of where it peaks
+
+```{r Individual Variable Plots}
+response(model_training)
+```
+To cross validated the model, the model is passed through the evaluate function of the dismo package where it's results are used to validated the model accuracy
+
+```{r Model Evaluation}
+cross_validation <- evaluate(p=testing_data[testing_data$fire==1,], a=testing_data[testing_data$fire==0,], model = model_training)
+```
+
+```{r Evaluation Results}
+cross_validation 
+```
+Plotting the Area Under Curve for the model to showcase its accuracy
+
+```{r AUC plot}
+plot(cross_validation, 'ROC', cex=1.1)
+```
+The next step involves using the current model data to predict areas with a probability of wildfire
+
+```{r Predicting Wildfire points using the model data and covariate stack}
+prob_wildfire <- predict(model_training, envCovariates)
+```
+
+```{r Generating a probability map}
+tm_shape(prob_wildfire) +
+    tm_raster(title = "Predicted Probability", palette = '-RdYlBu', style ='cont', breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1.0))+
+tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+    tm_layout(main.title = "Probability of Wildfire with Historic Variables", main.title.position = c(0.2, 0.7), title.size=3, legend.text.size = 2, 
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 2, frame='white')+
+    tm_scale_bar(position=c(0.001, 0.01), text.size = 1, breaks = c(0, 150, 300, 450))+
+    tm_compass(north = 0,type = 'arrow', position = c('right', 'top'), text.size = 0.75)
+```
+
+```{r Calculating the threshold for the model}
+threshold_value <- threshold(cross_validation, "spec_sens")
+
+#displaying the result
+threshold_value
+```
+Creating a matrix exceeding a threshold value to plot a map of predicted wildfire points that are above the value
+
+```{r Creating a class matrix}
+create_classes_vector <- c(0, threshold_value, 0, threshold_value, 1, 1)
+create_clasess_matrix <- matrix(create_classes_vector, ncol = 3, byrow = TRUE)
+create_clasess_matrix
+```
+
+```{r Creating a new Raster wtih the points exceeding the threshold }
+suitability_wildfires <- reclassify(prob_wildfire, create_clasess_matrix)
+```
+
+```{r Plotting the Suitablity map}
+tm_shape(suitability_wildfires) + tm_raster(style = "cat", title = "Threshold", palette= c("lightgrey", "darkorange"), labels = c("Safe Areas", "Possible trigger Points")) +
+  tm_layout(main.title = "Wildfire Threshold with Historic Variables", main.title.position = c(0.2, 0.7), title.size=3) +
+    tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+    tm_layout(frame = FALSE, legend.outside = TRUE)
+```
+
+
+```{r Repeating Chunks 40-52 from Chunks 53-65}
+tic("MaxEnt")
+new_model_training <- maxent(x=new_training_data[,c(1,2,3,4,5)], p=new_training_data[,6], args=c("responsecurves"))
+toc()
+```
+
+```{r}
+plot(new_model_training, pch=19, xlab = "Percentage [%]", cex=1.1)
+```
+
+```{r}
+new_model_training@results
+```
+
+
+```{r}
+response(new_model_training)
+```
+
+```{r}
+new_cross_validation <- evaluate(p=new_testing_data[new_testing_data$fire==1,], a=new_testing_data[new_testing_data$fire==0,], model = new_model_training)
+```
+
+```{r}
+new_cross_validation 
+```
+
+```{r}
+plot(new_cross_validation, 'ROC', cex=1)
+```
+
+```{r}
+new_prob_wildfire <- predict(new_model_training, futureenvCovariates)
+```
+
+```{r}
+tm_shape(new_prob_wildfire) +
+    tm_raster(title = "Predicted Probability", palette = 'YlOrRd', style ='cont', breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1.0))+
+tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+    tm_layout(main.title = "Probability of Wildfire with Future Variables", main.title.position = c(0.2, 0.7), title.size=3, legend.text.size = 2, 
+        legend.position = c(0.55, 0.70), legend.height= -0.3, legend.title.size = 2, frame='white')+
+    tm_scale_bar(position=c(0.001, 0.01), text.size = 1, breaks = c(0, 150, 300, 450))+
+    tm_compass(north = 0,type = 'arrow', position = c('right', 'top'), text.size = 0.75)
+```
+
+```{r}
+new_threshold_value <- threshold(new_cross_validation, "spec_sens")
+new_threshold_value
+```
+
+```{r}
+new_create_classes_vector <- c(0, new_threshold_value, 0, new_threshold_value, 1, 1)
+new_create_clasess_matrix <- matrix(new_create_classes_vector, ncol = 3, byrow = TRUE)
+new_create_clasess_matrix
+```
+
+```{r}
+new_suitability_wildfires <- reclassify(new_prob_wildfire, new_create_clasess_matrix)
+```
+
+```{r}
+tm_shape(suitability_wildfires) + tm_raster(style = "cat", title = "Threshold", palette= c("lightgrey", "darkred"), labels = c("Safe Areas", "Possible trigger Points")) +
+  tm_layout(main.title = "Wildfire Threshold with Future Variables", main.title.position = c(0.2, 0.7), title.size=3) +
+    tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+    tm_layout(frame = FALSE, legend.outside = TRUE)
+```
+
+The final part of the analysis includes identify the states in particular which are affected by predicted wildifire and ensuring that certain species within the state who are severely endangered can be protected.
+
+```{r Highlighting states with high predicted wildfire in a map}
+states_to_highlight <- c("Punjab", "Haryana", "Delhi", "Assam", "Meghalaya", "Manipur", "Nagaland", "Tripura","Mizoram","Arunachal Pradesh", "Uttar Pradesh", "Chhattisgarh", "Maharashtra", "Orissa",	
+"Madhya Pradesh")
+filtered_shapefile <- subset(newind_sf, ST_NAME %in% states_to_highlight)
+
+map <- tm_shape(newind_sf) +
+  tm_borders() +  # Add borders to all states
+  tm_shape(filtered_shapefile) +
+  tm_fill(col = "red") +  # Fill selected states with red (you can choose any color)
+  tm_borders(lwd = 0.5, col = "black") +  # Add thicker black borders to highlighted states
+  tm_layout(main.title = "States with Predicted Wildfire", main.title.position = c(0.2, 0.7), title.size=3)
+
+# Display the map
+map 
+```
+
+Adding wildlife Rasters from the IUCN portal
+
+```{r Loading in Wildfire data}
+red_list <- raster("Combined_SR_2022/Combined_SR_2022.tif")
+threat <- raster("Combined_THR_SR_2022/Combined_THR_SR_2022.tif")
+```
+
+
+```{r Similar steps to Chunk 14-16 in Chunk 68-70}
+red_resampled <- projectRaster(red_list,temp_mask, method = 'bilinear')
+threat_resampled <- projectRaster(threat,temp_mask, method = 'bilinear')
+
+qtm(red_resampled)
+qtm(threat_resampled)
+```
+
+
+```{r}
+red_resampled
+threat_resampled
+temp_mask
+```
+
+
+```{r}
+red_crop <- crop(red_resampled, newind_sf)
+red_mask <- mask(red_crop,newind_sf)
+
+threat_crop <- crop(threat_resampled, newind_sf)
+threat_mask <- mask(threat_crop,newind_sf)
+
+red_mask
+threat_mask
+```
+
+```{r Generating a Quick Tmap of the rasters}
+qtm(red_mask)
+qtm(threat_mask)
+```
+The Red list and Threatened species count across the different states in the country are plotted 
+
+```{r Red List Count}
+tm_shape(red_mask) + tm_raster(style = "pretty", title = "Species Count", palette= c("orange", "purple")) +
+tm_shape(new_suitability_wildfires) + tm_raster(style = "cat", title = "Wildfire Threshold", palette= c("lightgrey", "red"), labels = c("Safe Areas", "Possible trigger Points"), alpha = 0.3) +
+    tm_layout(main.title = "Red List Species Affected", main.title.position = c(0.2, 0.7), title.size=3) +
+    tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+    tm_layout(frame = FALSE, legend.outside = TRUE)
+```
+
+```{r Threatened Count}
+tm_shape(threat_mask) + tm_raster(style = "pretty", title = "Species Count", palette= c("orange", "purple")) +
+tm_shape(new_suitability_wildfires) + tm_raster(style = "cat", title = "Wildfire Threshold", palette= c("lightgrey", "red"), labels = c("Safe Areas", "Possible trigger Points"), alpha = 0.3) +
+      tm_layout(main.title = "Threatened Species Affected", main.title.position = c(0.2, 0.7), title.size=3) +
+    tm_shape(newind_sf) + tm_polygons(alpha = 0, border.col = "black") +
+    tm_layout(frame = FALSE, legend.outside = TRUE)
+```
+
+To make the results more practical for animal protection, it is important to identify the areas where animals are endangered and cross-check them with the IUCN list I
+
+```{r Loading Distric SF}
+district <- read_sf("gadm41_IND_shp/gadm41_IND_3.shp")
+qtm(district)
+```
+
+```{r District Head}
+district
+```
+The values from the rasters for the new geographic divisons are then extracted and put into a new data frame
+
+```{r Extracting Values from the Rasters}
+
+threat_aggregated <- extract(threat, district, fun = sum, na.rm = TRUE)
+
+red_list_aggregated <- extract(red_list, district, fun = sum, na.rm = TRUE)
+
+district_data <- data.frame(District = district$NAME_3, Threat = threat_aggregated, Red_List = red_list_aggregated)
+
+```
+
+Creating a Plot to visualise the values
+
+```{r Visualising Values}
+ggplot() +
+  geom_sf(data = district, aes(fill = district_data$Red_List)) +
+  scale_fill_gradient(low = "green", high = "red", name = "Presence by District") +
+  labs(title = "Aggegated Red List Species Presence") +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(data = district, aes(fill = district_data$Threat)) +
+  scale_fill_gradient(low = "green", high = "red", name = "Presence by District") +
+  labs(title = "Aggegated Threatened Species Presence") +
+  theme_minimal()
+```
+
+The next step is to identify the districts which top both the lists
+
+```{r Maximum Threat and Red List}
+
+# Finding the index of the district with the highest threat  and Red List value
+max_threat_index <- which.max(district_data$Threat)
+max_red_list_index <- which.max(district_data$Red_List)
+
+# Extract the names of the districts
+district_with_max_threat <- district_data$District[max_threat_index]
+district_with_max_red_list <- district_data$District[max_red_list_index]
+
+cat("District with the highest threat:", district_with_max_threat, "\n")
+cat("District with the highest red list:", district_with_max_red_list, "\n")
+
+```
+
+
+
+```{r Threat Prevalence}
+# Calculating threat and red-list prevalence in an area by dividing it with the total number of districts
+total_districts <- nrow(district_data)
+district_data$Threat_Prevalence <- district_data$Threat / total_districts
+district_data$Red_List_Prevalence <- district_data$Red_List / total_districts
+
+# Setting the prevalence threshold as values that allow 5-6 districts to be isolated to avoid overwhelming results
+threat_threshold <- 0.22
+red_threshold <- 2.3
+
+
+# Filtering the data frame based on the threshold for threat and Red List values
+high_threat_districts <- district_data[district_data$Threat_Prevalence > threat_threshold, ]
+high_red_list_districts <- district_data[district_data$Red_List_Prevalence > red_threshold, ]
+
+# Sorting the data frames in descending order of prevalence
+high_threat_districts <- high_threat_districts[order(-high_threat_districts$Threat_Prevalence), ]
+high_red_list_districts <- high_red_list_districts[order(-high_red_list_districts$Red_List_Prevalence), ]
+
+# Extracting the names of places with the highest prevalence values
+names_of_high_threat_districts <- high_threat_districts$District
+names_of_high_red_list_districts <- high_red_list_districts$District
+
+print(names_of_high_threat_districts)
+print(names_of_high_red_list_districts)
+toc()
+```
